@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# Allow all origins (adjust in production)
+# Allow all origins (adjust this for production)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -41,7 +41,8 @@ async def submit_job(
     participant_label: str = Form(...),
     modalities: str = Form(...),
     n_procs: int = Form(12),
-    mem_gb: int = Form(48)
+    mem_gb: int = Form(48),
+    session_id: Optional[str] = Form(None)
 ):
     job_id = str(uuid.uuid4())[:8]
     job_dir = UPLOAD_ROOT / job_id
@@ -65,7 +66,17 @@ async def submit_job(
     result_dir = OUTPUT_ROOT / job_id
     jobs[job_id] = {"status": "pending", "result": None}
 
-    asyncio.create_task(run_mriqc_job(job_id, extract_dir, result_dir, participant_label, modalities, n_procs, mem_gb))
+    asyncio.create_task(run_mriqc_job(
+        job_id=job_id,
+        bids_dir=extract_dir,
+        output_dir=result_dir,
+        participant_label=participant_label,
+        modalities=modalities,
+        n_procs=n_procs,
+        mem_gb=mem_gb,
+        session_id=session_id
+    ))
+
     return {"job_id": job_id, "status": "started"}
 
 @app.get("/job-status/{job_id}")
@@ -81,7 +92,34 @@ async def download_result(job_id: str):
         raise HTTPException(status_code=404, detail="Result not ready or not found")
     return FileResponse(result_zip, filename=f"mriqc_results_{job_id}.zip")
 
-async def run_mriqc_job(job_id, bids_dir, output_dir, participant_label, modalities, n_procs, mem_gb):
+@app.delete("/delete-job/{job_id}")
+async def delete_job(job_id: str):
+    # Clean all related directories
+    for root in [UPLOAD_ROOT, OUTPUT_ROOT, RESULT_ROOT]:
+        job_path = root / job_id
+        if job_path.exists():
+            shutil.rmtree(job_path, ignore_errors=True)
+
+    zip_file = RESULT_ROOT / f"{job_id}.zip"
+    if zip_file.exists():
+        zip_file.unlink()
+
+    if job_id in jobs:
+        del jobs[job_id]
+
+    return {"status": "deleted"}
+
+# Async MRIQC Task
+async def run_mriqc_job(
+    job_id: str,
+    bids_dir: Path,
+    output_dir: Path,
+    participant_label: str,
+    modalities: str,
+    n_procs: int,
+    mem_gb: int,
+    session_id: Optional[str]
+):
     try:
         cmd = [
             "docker", "run", "--rm",
@@ -98,9 +136,10 @@ async def run_mriqc_job(job_id, bids_dir, output_dir, participant_label, modalit
             "--no-sub",
             "--verbose-reports"
         ]
-        # 🆕 Add session-id flag if provided
+
         if session_id:
             cmd += ["--session-id", session_id]
+
         jobs[job_id]["status"] = "running"
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -110,14 +149,17 @@ async def run_mriqc_job(job_id, bids_dir, output_dir, participant_label, modalit
         stdout, stderr = await proc.communicate()
 
         if proc.returncode != 0:
-            jobs[job_id] = {"status": "failed", "error": stderr.decode()}
+            jobs[job_id] = {
+                "status": "failed",
+                "error": stderr.decode()[-2000:]  # keep last 2KB
+            }
             return
 
         # Package result
         zip_out = RESULT_ROOT / f"{job_id}.zip"
         shutil.make_archive(str(zip_out).replace(".zip", ""), 'zip', root_dir=output_dir)
 
-        jobs[job_id] = {"status": "complete", "result": str(zip_out)}
+        jobs[job_id] = {"status": "completed", "result": str(zip_out)}
 
     except Exception as e:
         jobs[job_id] = {"status": "failed", "error": str(e)}
