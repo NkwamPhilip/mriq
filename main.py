@@ -98,6 +98,9 @@ async def run_mriqc_job(job_id, bids_dir, output_dir, participant_label, modalit
             "--no-sub",
             "--verbose-reports"
         ]
+        # 🆕 Add session-id flag if provided
+        if session_id:
+            cmd += ["--session-id", session_id]
         jobs[job_id]["status"] = "running"
         proc = await asyncio.create_subprocess_exec(
             *cmd,
