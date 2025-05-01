@@ -14,9 +14,10 @@ from fastapi.middleware.cors import CORSMiddleware
 import redis
 import json
 
-USE_REDIS = True  # Flip to False to use file-based tracking
+# Toggle to switch between Redis or in-memory tracking
+USE_REDIS = True
 
-# Redis setup
+# Redis Configuration
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
@@ -28,7 +29,7 @@ except Exception as e:
         raise RuntimeError(f"Could not connect to Redis: {e}")
     rdb = None
 
-# FastAPI init
+# Initialize FastAPI
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -45,6 +46,7 @@ os.makedirs(UPLOAD_ROOT, exist_ok=True)
 os.makedirs(OUTPUT_ROOT, exist_ok=True)
 os.makedirs(RESULT_ROOT, exist_ok=True)
 
+# In-memory fallback jobs dict
 jobs: Dict[str, Dict] = {}
 
 @app.get("/health")
@@ -57,7 +59,8 @@ async def submit_job(
     participant_label: str = Form(...),
     modalities: str = Form(...),
     n_procs: int = Form(12),
-    mem_gb: int = Form(48)
+    mem_gb: int = Form(48),
+    session_id: Optional[str] = Form(None)
 ):
     job_id = str(uuid.uuid4())[:8]
     job_dir = UPLOAD_ROOT / job_id
@@ -75,7 +78,11 @@ async def submit_job(
     result_dir = OUTPUT_ROOT / job_id
     set_status(job_id, {"status": "pending", "result": None})
 
-    asyncio.create_task(run_mriqc_job(job_id, extract_dir, result_dir, participant_label, modalities, n_procs, mem_gb))
+    asyncio.create_task(run_mriqc_job(
+        job_id, extract_dir, result_dir,
+        participant_label, modalities, n_procs, mem_gb, session_id
+    ))
+
     return {"job_id": job_id}
 
 @app.get("/job-status/{job_id}")
@@ -103,27 +110,28 @@ def delete_job(job_id: str):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# Redis/file-based tracking
+# Redis/file-based status tracking
 def set_status(job_id: str, status: dict):
-    if USE_REDIS:
+    if USE_REDIS and rdb:
         rdb.set(f"mriqc:{job_id}", json.dumps(status))
     else:
         jobs[job_id] = status
 
 def get_status(job_id: str):
-    if USE_REDIS:
+    if USE_REDIS and rdb:
         raw = rdb.get(f"mriqc:{job_id}")
         return json.loads(raw) if raw else None
     return jobs.get(job_id)
 
 def clear_status(job_id: str):
-    if USE_REDIS:
+    if USE_REDIS and rdb:
         rdb.delete(f"mriqc:{job_id}")
     else:
         jobs.pop(job_id, None)
 
-# MRIQC Execution
-async def run_mriqc_job(job_id, bids_dir, output_dir, participant_label, modalities, n_procs, mem_gb):
+# MRIQC job runner
+async def run_mriqc_job(job_id, bids_dir, output_dir,
+                        participant_label, modalities, n_procs, mem_gb, session_id=None):
     try:
         cmd = [
             "docker", "run", "--rm",
@@ -137,10 +145,8 @@ async def run_mriqc_job(job_id, bids_dir, output_dir, participant_label, modalit
             "-m", *modalities.split(),
             "--nprocs", str(n_procs),
             "--omp-nthreads", "4",
-            "--no-sub", "--verbose-reports"
+            "--no-sub", "--verbose-reports", "--session-id", session_id
         ]
-         if session_id:
-            cmd += ["--session-id", session_id]
 
         set_status(job_id, {"status": "running"})
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
