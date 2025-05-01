@@ -6,20 +6,37 @@ import subprocess
 import asyncio
 from pathlib import Path
 from typing import Optional, Dict
+
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI()
+import redis
+import json
 
-# Allow all origins (adjust this for production)
+USE_REDIS = True  # Flip to False to use file-based tracking
+
+# Redis setup
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+
+try:
+    rdb = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
+    rdb.ping()
+except Exception as e:
+    if USE_REDIS:
+        raise RuntimeError(f"Could not connect to Redis: {e}")
+    rdb = None
+
+# FastAPI init
+app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"]
 )
 
-# Global Paths
+# Paths
 BASE_DIR = Path("/mnt")
 UPLOAD_ROOT = BASE_DIR / "mriqc_upload"
 OUTPUT_ROOT = BASE_DIR / "mriqc_output"
@@ -28,12 +45,11 @@ os.makedirs(UPLOAD_ROOT, exist_ok=True)
 os.makedirs(OUTPUT_ROOT, exist_ok=True)
 os.makedirs(RESULT_ROOT, exist_ok=True)
 
-# Track jobs
 jobs: Dict[str, Dict] = {}
 
 @app.get("/health")
-async def health():
-    return {"status": "ok", "message": "MRIQC backend is live"}
+def health():
+    return {"status": "ok"}
 
 @app.post("/submit-job")
 async def submit_job(
@@ -41,85 +57,73 @@ async def submit_job(
     participant_label: str = Form(...),
     modalities: str = Form(...),
     n_procs: int = Form(12),
-    mem_gb: int = Form(48),
-    session_id: Optional[str] = Form(None)
+    mem_gb: int = Form(48)
 ):
     job_id = str(uuid.uuid4())[:8]
     job_dir = UPLOAD_ROOT / job_id
-    os.makedirs(job_dir, exist_ok=True)
+    job_dir.mkdir(parents=True, exist_ok=True)
     bids_path = job_dir / "bids_dataset.zip"
 
-    try:
-        with open(bids_path, "wb") as f:
-            while chunk := await bids_zip.read(1024 * 1024):
-                f.write(chunk)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
+    with open(bids_path, "wb") as f:
+        while chunk := await bids_zip.read(1024 * 1024):
+            f.write(chunk)
 
     extract_dir = job_dir / "bids"
-    try:
-        with zipfile.ZipFile(bids_path, 'r') as zf:
-            zf.extractall(extract_dir)
-    except zipfile.BadZipFile:
-        raise HTTPException(status_code=400, detail="Invalid ZIP file format")
+    with zipfile.ZipFile(bids_path, 'r') as zf:
+        zf.extractall(extract_dir)
 
     result_dir = OUTPUT_ROOT / job_id
-    jobs[job_id] = {"status": "pending", "result": None}
+    set_status(job_id, {"status": "pending", "result": None})
 
-    asyncio.create_task(run_mriqc_job(
-        job_id=job_id,
-        bids_dir=extract_dir,
-        output_dir=result_dir,
-        participant_label=participant_label,
-        modalities=modalities,
-        n_procs=n_procs,
-        mem_gb=mem_gb,
-        session_id=session_id
-    ))
-
-    return {"job_id": job_id, "status": "started"}
+    asyncio.create_task(run_mriqc_job(job_id, extract_dir, result_dir, participant_label, modalities, n_procs, mem_gb))
+    return {"job_id": job_id}
 
 @app.get("/job-status/{job_id}")
-async def job_status(job_id: str):
-    if job_id not in jobs:
+def job_status(job_id: str):
+    status = get_status(job_id)
+    if not status:
         raise HTTPException(status_code=404, detail="Job ID not found")
-    return jobs[job_id]
+    return status
 
 @app.get("/download/{job_id}")
-async def download_result(job_id: str):
+def download_result(job_id: str):
     result_zip = RESULT_ROOT / f"{job_id}.zip"
     if not result_zip.exists():
-        raise HTTPException(status_code=404, detail="Result not ready or not found")
-    return FileResponse(result_zip, filename=f"mriqc_results_{job_id}.zip")
+        raise HTTPException(status_code=404, detail="Result not found")
+    return FileResponse(result_zip, filename=f"mriqc_results_{job_id}.zip", media_type="application/zip")
 
 @app.delete("/delete-job/{job_id}")
-async def delete_job(job_id: str):
-    # Clean all related directories
-    for root in [UPLOAD_ROOT, OUTPUT_ROOT, RESULT_ROOT]:
-        job_path = root / job_id
-        if job_path.exists():
-            shutil.rmtree(job_path, ignore_errors=True)
+def delete_job(job_id: str):
+    try:
+        shutil.rmtree(UPLOAD_ROOT / job_id, ignore_errors=True)
+        shutil.rmtree(OUTPUT_ROOT / job_id, ignore_errors=True)
+        (RESULT_ROOT / f"{job_id}.zip").unlink(missing_ok=True)
+        clear_status(job_id)
+        return {"status": "deleted"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
-    zip_file = RESULT_ROOT / f"{job_id}.zip"
-    if zip_file.exists():
-        zip_file.unlink()
+# Redis/file-based tracking
+def set_status(job_id: str, status: dict):
+    if USE_REDIS:
+        rdb.set(f"mriqc:{job_id}", json.dumps(status))
+    else:
+        jobs[job_id] = status
 
-    if job_id in jobs:
-        del jobs[job_id]
+def get_status(job_id: str):
+    if USE_REDIS:
+        raw = rdb.get(f"mriqc:{job_id}")
+        return json.loads(raw) if raw else None
+    return jobs.get(job_id)
 
-    return {"status": "deleted"}
+def clear_status(job_id: str):
+    if USE_REDIS:
+        rdb.delete(f"mriqc:{job_id}")
+    else:
+        jobs.pop(job_id, None)
 
-# Async MRIQC Task
-async def run_mriqc_job(
-    job_id: str,
-    bids_dir: Path,
-    output_dir: Path,
-    participant_label: str,
-    modalities: str,
-    n_procs: int,
-    mem_gb: int,
-    session_id: Optional[str]
-):
+# MRIQC Execution
+async def run_mriqc_job(job_id, bids_dir, output_dir, participant_label, modalities, n_procs, mem_gb):
     try:
         cmd = [
             "docker", "run", "--rm",
@@ -133,36 +137,25 @@ async def run_mriqc_job(
             "-m", *modalities.split(),
             "--nprocs", str(n_procs),
             "--omp-nthreads", "4",
-            "--no-sub",
-            "--verbose-reports"
+            "--no-sub", "--verbose-reports"
         ]
-
-        if session_id:
+         if session_id:
             cmd += ["--session-id", session_id]
 
-        jobs[job_id]["status"] = "running"
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
+        set_status(job_id, {"status": "running"})
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         stdout, stderr = await proc.communicate()
 
         if proc.returncode != 0:
-            jobs[job_id] = {
-                "status": "failed",
-                "error": stderr.decode()[-2000:]  # keep last 2KB
-            }
+            set_status(job_id, {"status": "failed", "error": stderr.decode()})
             return
 
-        # Package result
         zip_out = RESULT_ROOT / f"{job_id}.zip"
         shutil.make_archive(str(zip_out).replace(".zip", ""), 'zip', root_dir=output_dir)
-
-        jobs[job_id] = {"status": "completed", "result": str(zip_out)}
+        set_status(job_id, {"status": "complete", "result": str(zip_out)})
 
     except Exception as e:
-        jobs[job_id] = {"status": "failed", "error": str(e)}
+        set_status(job_id, {"status": "failed", "error": str(e)})
 
 if __name__ == "__main__":
     import uvicorn
