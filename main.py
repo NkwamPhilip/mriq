@@ -14,10 +14,10 @@ from fastapi.middleware.cors import CORSMiddleware
 import redis
 import json
 
-# Toggle to switch between Redis or in-memory tracking
+# Toggle Redis tracking
 USE_REDIS = True
 
-# Redis Configuration
+# Redis config
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
@@ -29,7 +29,7 @@ except Exception as e:
         raise RuntimeError(f"Could not connect to Redis: {e}")
     rdb = None
 
-# Initialize FastAPI
+# App initialization
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -37,7 +37,7 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"]
 )
 
-# Paths
+# File paths
 BASE_DIR = Path("/mnt")
 UPLOAD_ROOT = BASE_DIR / "mriqc_upload"
 OUTPUT_ROOT = BASE_DIR / "mriqc_output"
@@ -46,21 +46,20 @@ os.makedirs(UPLOAD_ROOT, exist_ok=True)
 os.makedirs(OUTPUT_ROOT, exist_ok=True)
 os.makedirs(RESULT_ROOT, exist_ok=True)
 
-# In-memory fallback jobs dict
 jobs: Dict[str, Dict] = {}
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "redis": USE_REDIS}
 
 @app.post("/submit-job")
 async def submit_job(
     bids_zip: UploadFile = File(...),
     participant_label: str = Form(...),
     modalities: str = Form(...),
+    session_id: Optional[str] = Form(None),
     n_procs: int = Form(12),
-    mem_gb: int = Form(48),
-    session_id: Optional[str] = Form(None)
+    mem_gb: int = Form(48)
 ):
     job_id = str(uuid.uuid4())[:8]
     job_dir = UPLOAD_ROOT / job_id
@@ -78,11 +77,9 @@ async def submit_job(
     result_dir = OUTPUT_ROOT / job_id
     set_status(job_id, {"status": "pending", "result": None})
 
-    asyncio.create_task(run_mriqc_job(
-        job_id, extract_dir, result_dir,
-        participant_label, modalities, n_procs, mem_gb, session_id
-    ))
-
+    asyncio.create_task(
+        run_mriqc_job(job_id, extract_dir, result_dir, participant_label, modalities, n_procs, mem_gb, session_id)
+    )
     return {"job_id": job_id}
 
 @app.get("/job-status/{job_id}")
@@ -110,7 +107,7 @@ def delete_job(job_id: str):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# Redis/file-based status tracking
+# Redis or memory status handlers
 def set_status(job_id: str, status: dict):
     if USE_REDIS and rdb:
         rdb.set(f"mriqc:{job_id}", json.dumps(status))
@@ -129,9 +126,8 @@ def clear_status(job_id: str):
     else:
         jobs.pop(job_id, None)
 
-# MRIQC job runner
-async def run_mriqc_job(job_id, bids_dir, output_dir,
-                        participant_label, modalities, n_procs, mem_gb, session_id=None):
+# Async MRIQC runner
+async def run_mriqc_job(job_id, bids_dir, output_dir, participant_label, modalities, n_procs, mem_gb, session_id=None):
     try:
         cmd = [
             "docker", "run", "--rm",
@@ -145,11 +141,20 @@ async def run_mriqc_job(job_id, bids_dir, output_dir,
             "-m", *modalities.split(),
             "--nprocs", str(n_procs),
             "--omp-nthreads", "4",
-            "--no-sub", "--verbose-reports", "--session-id", session_id
+            "--no-sub",
+            "--verbose-reports"
         ]
 
+        if session_id:
+            cmd += ["--session-id", session_id]
+
         set_status(job_id, {"status": "running"})
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
         stdout, stderr = await proc.communicate()
 
         if proc.returncode != 0:
@@ -165,4 +170,4 @@ async def run_mriqc_job(job_id, bids_dir, output_dir,
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, workers=1)
