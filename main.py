@@ -52,11 +52,12 @@ def health():
     return {"status": "ok"}
 
 @app.post("/submit-job")
+
 async def submit_job(
     bids_zip: UploadFile = File(...),
     participant_label: str = Form(...),
     modalities: str = Form(...),
-    session_id: Optional[str] = Form(None),
+    session_id: str = Form("baseline"),  # Default value set here
     n_procs: int = Form(12),
     mem_gb: int = Form(48)
 ):
@@ -130,14 +131,22 @@ def clear_status(job_id: str):
         jobs.pop(job_id, None)
 
 # MRIQC Execution
-async def run_mriqc_job(job_id, bids_dir, output_dir,
-                        participant_label, modalities, n_procs, mem_gb,
-                        session_id=None):
+async def run_mriqc_job(
+    job_id, 
+    bids_dir, 
+    output_dir,
+    participant_label, 
+    modalities, 
+    n_procs, 
+    mem_gb,
+    session_id="baseline"  # Default session_id if not provided
+):
     try:
         cmd = [
             "docker", "run", "--rm",
             "--memory", f"{mem_gb}g", "--memory-swap", f"{mem_gb}g",
             "--cpus", str(n_procs),
+            "--session-id", session_id,  # Always include this value
             "-v", f"{bids_dir}:/data:ro",
             "-v", f"{output_dir}:/out",
             "nipreps/mriqc:22.0.6",
@@ -146,13 +155,16 @@ async def run_mriqc_job(job_id, bids_dir, output_dir,
             "-m", *modalities.split(),
             "--nprocs", str(n_procs),
             "--omp-nthreads", "4",
-            "--no-sub", "--verbose-reports"
+            "--no-sub",
+            "--verbose-reports"
         ]
-        if session_id:
-            cmd.extend(["--session-id", session_id])
 
         set_status(job_id, {"status": "running"})
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
         stdout, stderr = await proc.communicate()
 
         if proc.returncode != 0:
