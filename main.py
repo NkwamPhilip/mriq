@@ -146,18 +146,19 @@ async def run_mriqc_job(
             "docker", "run", "--rm",
             "--memory", f"{mem_gb}g", "--memory-swap", f"{mem_gb}g",
             "--cpus", str(n_procs),
-            "--session-id", session_id,  # Always include this value
             "-v", f"{bids_dir}:/data:ro",
             "-v", f"{output_dir}:/out",
-            "nipreps/mriqc:22.0.6",
+            "nipreps/mriqc:22.0.6",           
             "/data", "/out", "participant",
             "--participant_label", participant_label,
+            "--session-id", session_id,           
             "-m", *modalities.split(),
             "--nprocs", str(n_procs),
             "--omp-nthreads", "4",
             "--no-sub",
             "--verbose-reports"
         ]
+
 
         set_status(job_id, {"status": "running"})
         proc = await asyncio.create_subprocess_exec(
